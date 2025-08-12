@@ -67,6 +67,74 @@ mover_directorio() {
 	fi
 }
 
+# Seguridad: validación de SQL
+validar_sql_en_archivo() {
+    local archivo_sql="$1"
+    [[ ! -f "$archivo_sql" ]] && return 0
+
+    # Analiza por sentencias potencialmente peligrosas a nivel de sentencia (separadas por ;) en modo case-insensitive
+    # Si se detecta alguna, awk saldrá con código 3.
+    local salida
+    if ! salida=$(awk '
+        BEGIN { RS=";"; IGNORECASE=1 }
+        {
+            stmt=$0
+            gsub(/\n/," ",stmt)
+            peligro = 0
+            if (stmt ~ /\bDROP[[:space:]]+(DATABASE|SCHEMA|TABLE|VIEW|TRIGGER|EVENT|FUNCTION|PROCEDURE)\b/) peligro=1
+            else if (stmt ~ /\bTRUNCATE[[:space:]]+TABLE\b/) peligro=1
+            else if (stmt ~ /\bDELETE[[:space:]]+FROM\b/ && stmt !~ /\bWHERE\b/) peligro=1
+            else if (stmt ~ /\bUPDATE\b/ && stmt ~ /\bSET\b/ && stmt !~ /\bWHERE\b/) peligro=1
+            else if (stmt ~ /\bCREATE[[:space:]]+USER\b/) peligro=1
+            else if (stmt ~ /\bALTER[[:space:]]+USER\b/) peligro=1
+            else if (stmt ~ /\bDROP[[:space:]]+USER\b/) peligro=1
+            else if (stmt ~ /\bGRANT\b/ && (stmt ~ /\bWITH[[:space:]]+GRANT[[:space:]]+OPTION\b/ || stmt ~ /\bSUPER\b/ || stmt ~ /\bFILE\b/)) peligro=1
+            else if (stmt ~ /\bREVOKE\b/) peligro=1
+            else if (stmt ~ /\bSET[[:space:]]+GLOBAL\b/ || stmt ~ /@@GLOBAL/ || stmt ~ /\bSET[[:space:]]+PERSIST\b/) peligro=1
+            else if (stmt ~ /\bINSTALL[[:space:]]+PLUGIN\b/ || stmt ~ /\bUNINSTALL[[:space:]]+PLUGIN\b/) peligro=1
+            else if (stmt ~ /\bLOAD[[:space:]]+DATA[[:space:]]+INFILE\b/ || stmt ~ /\bINTO[[:space:]]+OUTFILE\b/) peligro=1
+            else if (stmt ~ /\bCREATE[[:space:]]+FUNCTION\b/ && stmt ~ /\bSONAME\b/) peligro=1
+            else if (stmt ~ /\bCREATE[[:space:]]+EVENT\b/ || stmt ~ /\bALTER[[:space:]]+EVENT\b/ || stmt ~ /\bDROP[[:space:]]+EVENT\b/) peligro=1
+
+            if (peligro==1) {
+                print " - Sentencia sospechosa (bloque #" NR "):\n   " $0 "\n"
+                encontrado=1
+            }
+        }
+        END { if (encontrado) exit 3 }
+    ' "$archivo_sql" 2>/dev/null); then
+        echo "⚠️ Se detectaron posibles sentencias peligrosas en: $archivo_sql"
+        echo "$salida"
+        if [[ "${FORZAR_SQL_INSEGURO:-0}" == "1" ]]; then
+            echo "⏭️ FORZAR_SQL_INSEGURO=1 establecido. Continuando bajo su responsabilidad."
+            return 0
+        fi
+        local carpeta_cuarentena="$directorio_temporal/quarantine_sql"
+        mkdir -p "$carpeta_cuarentena"
+        mv "$archivo_sql" "$carpeta_cuarentena/" 2>/dev/null || true
+        mostrar_error "Validación SQL falló. Archivo movido a '$carpeta_cuarentena'. Revise y ejecute nuevamente (o establezca FORZAR_SQL_INSEGURO=1 para continuar bajo su propio riesgo)."
+    fi
+
+    return 0
+}
+
+validar_sql_en_directorio() {
+    local dir_sql="$1"
+    [[ ! -d "$dir_sql" ]] && return 0
+
+    local hay_archivos=0
+    while IFS= read -r -d '' f; do
+        hay_archivos=1
+        validar_sql_en_archivo "$f"
+    done < <(find "$dir_sql" -type f -iname "*.sql" -print0)
+
+    if [[ $hay_archivos -eq 0 ]]; then
+        return 0
+    fi
+
+    return 0
+}
+
 # Función para crear archivo final
 crear_archivo_final() {
 	local nombre_archivo="$1"
@@ -360,11 +428,15 @@ fi
 if [[ -d "$directorio_jb5/database" ]]; then
 	mover_directorio "$directorio_jb5/database/*" "$directorio_cpanel/mysql"
 	extraer_archivos "$directorio_cpanel/mysql/*"
+    # Validar SQL de los dumps extraídos
+    validar_sql_en_directorio "$directorio_cpanel/mysql"
 fi
 
 # Procesar usuarios de base de datos
 if [[ -d "$directorio_jb5/database_user" ]]; then
 	generar_archivo_mysql "$directorio_jb5/database_user" "$directorio_cpanel/mysql.sql"
+    # Validar SQL generado de privilegios/usuarios
+    validar_sql_en_archivo "$directorio_cpanel/mysql.sql"
 fi
 
 # Procesar correo electrónico
